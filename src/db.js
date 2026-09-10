@@ -7,7 +7,7 @@
  */
 
 const DB_NAME = 'VKU_Field_Survey_DB_v5';
-const DB_VERSION = 1;
+const DB_VERSION = 3;
 const STORE_NAME = 'surveys';
 
 let useMemoryFallback = false;
@@ -72,12 +72,23 @@ export function openDatabase() {
 
       request.onupgradeneeded = (event) => {
         const db = event.target.result;
+        let store;
         if (!db.objectStoreNames.contains(STORE_NAME)) {
-          const store = db.createObjectStore(STORE_NAME, {
+          store = db.createObjectStore(STORE_NAME, {
             keyPath: 'id',
             autoIncrement: true
           });
+        } else {
+          store = event.target.transaction.objectStore(STORE_NAME);
+        }
+
+        if (!store.indexNames.contains('syncStatus')) {
+          store.createIndex('syncStatus', 'syncStatus', { unique: false });
+        }
+        if (!store.indexNames.contains('synced')) {
           store.createIndex('synced', 'synced', { unique: false });
+        }
+        if (!store.indexNames.contains('createdAt')) {
           store.createIndex('createdAt', 'createdAt', { unique: false });
         }
       };
@@ -128,9 +139,10 @@ export function openDatabase() {
 }
 
 /* ==========================================
-   2. LƯU KHẢO SÁT MỚI
+   2. LƯU KHẢO SÁT MỚI (MẶC ĐỊNH PENDING)
    ========================================== */
 export async function saveSurvey(survey) {
+  const now = new Date().toISOString();
   const record = {
     clientId: generateUUID(),
     inspector: survey.inspector || 'N/A',
@@ -139,8 +151,18 @@ export async function saveSurvey(survey) {
     condition: survey.condition || 'good',
     priority: survey.priority || 'medium',
     note: survey.note || '',
-    createdAt: new Date().toISOString(),
-    synced: false
+    photo: survey.photo || null,
+    latitude: survey.latitude != null ? survey.latitude : null,
+    longitude: survey.longitude != null ? survey.longitude : null,
+    gpsAccuracy: survey.gpsAccuracy != null ? survey.gpsAccuracy : null,
+    gpsTimestamp: survey.gpsTimestamp || null,
+    createdAt: now,
+    updatedAt: now,
+    syncStatus: 'PENDING',
+    synced: false,
+    retryCount: 0,
+    lastError: null,
+    syncedAt: null
   };
 
   const db = await openDatabase();
@@ -187,23 +209,40 @@ export async function saveSurvey(survey) {
 }
 
 /* ==========================================
-   3. LẤY TẤT CẢ KHẢO SÁT (TỰ CHUẨN HÓA FIELD)
+   3. LẤY TẤT CẢ KHẢO SÁT (CHUẨN HÓA SYNC STATUS)
    ========================================== */
 export async function getAllSurveys() {
   const db = await openDatabase();
 
-  const normalize = (item) => ({
-    id: item.id,
-    clientId: item.clientId || generateUUID(),
-    inspector: item.inspector || item.inspectorName || 'Khảo sát viên',
-    location: item.location || item.area || 'Phòng học',
-    facility: item.facility || item.inspectionItem || 'Thiết bị',
-    condition: item.condition || 'good',
-    priority: item.priority || 'medium',
-    note: item.note || item.notes || '',
-    createdAt: item.createdAt || new Date().toISOString(),
-    synced: Boolean(item.synced)
-  });
+  const normalize = (item) => {
+    let syncStatus = item.syncStatus;
+    if (!syncStatus) {
+      syncStatus = item.synced ? 'SYNCED' : 'PENDING';
+    }
+
+    return {
+      id: item.id,
+      clientId: item.clientId || generateUUID(),
+      inspector: item.inspector || item.inspectorName || 'Khảo sát viên',
+      location: item.location || item.area || 'Phòng học',
+      facility: item.facility || item.inspectionItem || 'Thiết bị',
+      condition: item.condition || 'good',
+      priority: item.priority || 'medium',
+      note: item.note || item.notes || '',
+      photo: item.photo || null,
+      latitude: item.latitude != null ? item.latitude : null,
+      longitude: item.longitude != null ? item.longitude : null,
+      gpsAccuracy: item.gpsAccuracy != null ? item.gpsAccuracy : null,
+      gpsTimestamp: item.gpsTimestamp || null,
+      createdAt: item.createdAt || new Date().toISOString(),
+      updatedAt: item.updatedAt || item.createdAt || new Date().toISOString(),
+      syncStatus: syncStatus,
+      synced: syncStatus === 'SYNCED',
+      retryCount: typeof item.retryCount === 'number' ? item.retryCount : 0,
+      lastError: item.lastError || null,
+      syncedAt: item.syncedAt || null
+    };
+  };
 
   if (useMemoryFallback || !db) {
     const sorted = [...memoryStore].map(normalize).sort(
@@ -251,6 +290,7 @@ export async function getSurveyById(id) {
    5. CẬP NHẬT KHẢO SÁT
    ========================================== */
 export async function updateSurvey(survey) {
+  survey.updatedAt = new Date().toISOString();
   const db = await openDatabase();
 
   if (useMemoryFallback || !db) {
@@ -284,7 +324,52 @@ export async function updateSurvey(survey) {
 }
 
 /* ==========================================
-   6. XÓA MỘT KHẢO SÁT
+   6. CẬP NHẬT TRẠNG THÁI ĐỒNG BỘ (SYNC STATUS)
+   ========================================== */
+export async function updateSurveySyncStatus(id, newStatus, errorMsg = null) {
+  const survey = await getSurveyById(id);
+  if (!survey) return null;
+
+  survey.syncStatus = newStatus;
+  survey.updatedAt = new Date().toISOString();
+  if (newStatus === 'SYNCED') {
+    survey.synced = true;
+    survey.syncedAt = new Date().toISOString();
+    survey.lastError = null;
+  } else if (newStatus === 'FAILED') {
+    survey.synced = false;
+    survey.retryCount = (survey.retryCount || 0) + 1;
+    survey.lastError = errorMsg || 'Lỗi đồng bộ dữ liệu với server';
+  } else if (newStatus === 'SYNCING') {
+    survey.synced = false;
+  } else if (newStatus === 'PENDING') {
+    survey.synced = false;
+  }
+
+  await updateSurvey(survey);
+  return survey;
+}
+
+/* ==========================================
+   7. TRUY VẤN QUEUE THEO TRẠNG THÁI
+   ========================================== */
+export async function getPendingSurveys() {
+  const surveys = await getAllSurveys();
+  return surveys.filter((s) => s.syncStatus === 'PENDING');
+}
+
+export async function getFailedSurveys() {
+  const surveys = await getAllSurveys();
+  return surveys.filter((s) => s.syncStatus === 'FAILED');
+}
+
+export async function getUnsyncedSurveys() {
+  const surveys = await getAllSurveys();
+  return surveys.filter((s) => s.syncStatus === 'PENDING' || s.syncStatus === 'FAILED');
+}
+
+/* ==========================================
+   8. XÓA MỘT KHẢO SÁT
    ========================================== */
 export async function deleteSurvey(id) {
   memoryStore = memoryStore.filter((s) => s.id !== id);
@@ -309,7 +394,7 @@ export async function deleteSurvey(id) {
 }
 
 /* ==========================================
-   7. XÓA TOÀN BỘ DỮ LIỆU
+   9. XÓA TOÀN BỘ DỮ LIỆU
    ========================================== */
 export async function deleteAllSurveys() {
   memoryStore = [];
@@ -334,20 +419,17 @@ export async function deleteAllSurveys() {
 }
 
 /* ==========================================
-   8. LẤY CÁC KHẢO SÁT CHƯA ĐỒNG BỘ
-   ========================================== */
-export async function getUnsyncedSurveys() {
-  const surveys = await getAllSurveys();
-  return surveys.filter((s) => !s.synced);
-}
-
-/* ==========================================
-   9. THỐNG KÊ KHẢO SÁT
+   10. THỐNG KÊ KHẢO SÁT CHI TIẾT
    ========================================== */
 export async function getSurveyStatistics() {
   const surveys = await getAllSurveys();
   const total = surveys.length;
-  const synced = surveys.filter((s) => s.synced).length;
-  const unsynced = total - synced;
-  return { total, synced, unsynced };
+  const synced = surveys.filter((s) => s.syncStatus === 'SYNCED').length;
+  const pending = surveys.filter((s) => s.syncStatus === 'PENDING').length;
+  const syncing = surveys.filter((s) => s.syncStatus === 'SYNCING').length;
+  const failed = surveys.filter((s) => s.syncStatus === 'FAILED').length;
+  const unsynced = pending + failed + syncing;
+
+  return { total, synced, pending, syncing, failed, unsynced };
 }
+

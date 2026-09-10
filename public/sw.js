@@ -104,3 +104,28 @@ async function handleNetworkFirst(request) {
     });
   }
 }
+
+/* ==========================================
+   Background Sync API (Optional)
+   ==========================================
+   Khi browser kích hoạt sync event (có mạng trở lại),
+   SW thông báo tất cả client windows để chạy sync queue.
+   Nếu browser không hỗ trợ, app vẫn dùng window 'online' event.
+   ========================================== */
+self.addEventListener('sync', (event) => {
+  if (event.tag === 'sync-surveys') {
+    console.log('[SW] ⚡ Background Sync triggered: sync-surveys');
+
+    event.waitUntil(
+      self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {
+        clients.forEach((client) => {
+          client.postMessage({
+            type: 'BACKGROUND_SYNC',
+            tag: 'sync-surveys'
+          });
+        });
+        console.log(`[SW] 📤 Đã gửi BACKGROUND_SYNC message đến ${clients.length} client(s)`);
+      })
+    );
+  }
+});

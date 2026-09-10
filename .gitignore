@@ -10,6 +10,17 @@ coverage
 dist
 build
 
+# Android build & IDE
+android/.gradle
+android/local.properties
+android/.idea
+android/app/build
+
+# Temporary scripts
+copy-assets.js
+copy-dist.js
+download-wrapper.js
+
 # Misc
 .DS_Store
 .env
